@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# qqr - replay recent qq answers: qqr (latest), qqr 3, qqr -l (list)
+exec "$(dirname "$0")/qq" -r "$@"

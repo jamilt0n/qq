@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# qq - quick question: one-shot terminal Q&A via Claude Code (claude -p)
+#
+#   qq how do i ls and sort by date?
+#   qq -x how do i ls and sort by date?    # + flag/name breakdown
+#   cat error.log | qq what does this mean
+#   qqr / qqr 3 / qqr -l                    # replay recent answers
+#
+# zsh: install.sh aliases qq to `noglob qq`, so `?` and `*` need no quoting.
+
+set -euo pipefail
+
+hist_dir="${XDG_STATE_HOME:-$HOME/.local/state}/qq"
+hist_max=5
+
+usage() {
+  cat <<EOF
+qq - quick question (Claude, one-shot, no tools)
+
+usage: qq [flags] <question...>
+       <cmd> | qq [flags] <question...>   # piped stdin is sent as context
+       qqr [n | -l]                       # replay answer n (1 = latest), -l lists
+
+flags (before the question, bundling ok: -xo):
+  -x          explain: break down each flag / command name (-t = time, ls = list)
+  -x          (or set QQ_EXPLAIN=1 to always explain)
+  -o          use opus (default: haiku, or \$QQ_MODEL)
+  -m MODEL    use a specific model (e.g. sonnet)
+  -r [n|-l]   replay (same as qqr)
+  -h          this help
+
+No quotes needed. Avoid apostrophes and | ; & < > unless you quote the whole question.
+Last $hist_max answers kept in $hist_dir
+EOF
+}
+
+replay() {
+  local n="${1:-1}" i
+  if [[ "$n" == -l ]]; then
+    for ((i = 1; i <= hist_max; i++)); do
+      [[ -f "$hist_dir/$i" ]] && printf '%d  %s\n' "$i" "$(head -n 1 "$hist_dir/$i")"
+    done
+    return 0
+  fi
+  if [[ ! "$n" =~ ^[0-9]+$ || ! -f "$hist_dir/$n" ]]; then
+    echo "qq: no answer #$n (qqr -l lists them)" >&2
+    return 1
+  fi
+  if [[ -t 1 ]]; then
+    printf '\033[2m› %s\033[0m\n' "$(head -n 1 "$hist_dir/$n")"
+  else
+    printf '› %s\n' "$(head -n 1 "$hist_dir/$n")"
+  fi
+  tail -n +2 "$hist_dir/$n"
+}
+
+save() {
+  local i
+  mkdir -p "$hist_dir"
+  for ((i = hist_max - 1; i >= 1; i--)); do
+    [[ -f "$hist_dir/$i" ]] && mv -f "$hist_dir/$i" "$hist_dir/$((i + 1))"
+  done
+  printf '%s\n%s\n' "$1" "$2" > "$hist_dir/1"
+}
+
+[[ "${1:-}" == --help ]] && { usage; exit 0; }
+[[ "${1:-}" == -r ]] && { shift; replay "$@"; exit; }
+
+model="${QQ_MODEL:-haiku}"
+explain="${QQ_EXPLAIN:-0}"   # QQ_EXPLAIN=1 → -x on by default
+
+# getopts stops at the first non-flag word, so `qq what does ls -t do`
+# doesn't treat -t as a flag.
+while getopts ":hxom:" opt; do
+  case "$opt" in
+    h) usage; exit 0 ;;
+    x) explain=1 ;;
+    o) model=opus ;;
+    m) model="$OPTARG" ;;
+    :) echo "qq: -$OPTARG needs a value" >&2; exit 2 ;;
+    *) echo "qq: unknown flag -$OPTARG (qq -h)" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+[[ $# -eq 0 ]] && { usage; exit 1; }
+command -v claude &>/dev/null || { echo "qq: claude not installed" >&2; exit 1; }
+
+question="$*"
+label="$question"
+(( explain )) && label="[-x] $label"
+
+# Piped/redirected input → attach as context (only real pipes/files, so a
+# non-tty stdin like /dev/null in scripts doesn't hang on cat)
+if [[ -p /dev/stdin || -f /dev/stdin ]]; then
+  question="$question
+
+<stdin>
+$(cat)
+</stdin>"
+  label="$label [+stdin]"
+fi
+
+# Detect environment so answers fit the machine
+case "$(uname -s)" in
+  Darwin) os="macOS $(sw_vers -productVersion 2>/dev/null) (BSD userland; GNU tools only if installed)" ;;
+  Linux)  os="$( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo Linux) (GNU userland)" ;;
+  MINGW*|MSYS*|CYGWIN*) os="Windows (Git Bash/MSYS; PowerShell also available)" ;;
+  *) os="$(uname -s)" ;;
+esac
+shell="$(basename "${SHELL:-sh}")"
+
+system="You are qq, a terminal assistant. You answer a single question with a single response; there is no follow-up.
+Topics are usually shell, CLI tools, Unix/Linux/macOS/Windows terminals, vim/neovim, tmux, git.
+
+Environment: $os, shell: $shell.
+Give answers that work on this system. If the command differs on other platforms, note it in one short line.
+
+Style:
+- Lead with the command. Be terse. A one-liner is often the whole answer.
+- Output prints raw in a terminal: no markdown headings, bold, tables, or code fences.
+- Put each command on its own line, indented two spaces, with a short # comment if helpful.
+- Explain only what is non-obvious."
+
+if (( explain )); then
+  system="$system
+
+Explain mode is ON. After the commands, add a compact breakdown so the user learns what the pieces mean:
+- One line per flag/option used: the letter, then the word it abbreviates or its long option name (e.g. \"-l  long listing\", \"-t  sort by time (modified)\", \"-r  reverse\").
+- If a command name is an abbreviation or has a non-obvious origin, say what it stands for (ls = list, grep = global regular expression print, chmod = change mode).
+- If a natural mnemonic falls out of the letters, give it in one line. Do not force one.
+- Optionally up to two short example variations, only if they teach something new.
+- Only state etymology you are confident of. Stay compact: no prose paragraphs."
+fi
+
+answer="$(claude -p "$question" \
+  --model "$model" \
+  --system-prompt "$system" \
+  --tools "" \
+  --setting-sources "" \
+  --strict-mcp-config \
+  --disable-slash-commands \
+  --no-session-persistence < /dev/null)"
+
+printf '%s\n' "$answer"
+[[ -n "$answer" ]] && save "$label" "$answer"
